@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -233,9 +236,14 @@ func parseS7CommHeader(data json.RawMessage) (S7CommHeader, error) {
 	return header, err
 }
 
-func processPackets(lines []string) map[string]any {
+type AddrValue struct {
+	Addr  DbAddress
+	Value any
+}
+
+func processPackets(lines []string) []AddrValue {
 	pendingJobs := make(map[int][]*JobData)
-	values := make(map[string]any)
+	var results []AddrValue
 
 	for i, line := range lines {
 		if i%2 == 0 || len(line) == 0 {
@@ -289,17 +297,66 @@ func processPackets(lines []string) map[string]any {
 					fmt.Println(err)
 					continue
 				}
-				values[addr.String()] = val
+				results = append(results, AddrValue{Addr: addr, Value: val})
 			}
 		}
 	}
 
-	return values
+	return results
 }
 
 func runTshark(pcapFile string) ([]byte, error) {
 	cmd := exec.Command("tshark", "-r", pcapFile, "-T", "ek", "-Y", "s7comm")
 	return cmd.Output()
+}
+
+func dedup(results []AddrValue) []AddrValue {
+	seen := make(map[string]int) // addr string -> index in deduped
+	var deduped []AddrValue
+	for _, r := range results {
+		key := r.Addr.String()
+		if idx, ok := seen[key]; ok {
+			deduped[idx].Value = r.Value
+		} else {
+			seen[key] = len(deduped)
+			deduped = append(deduped, r)
+		}
+	}
+	return deduped
+}
+
+func writeCSV(filename string, results []AddrValue) error {
+	sort.Slice(results, func(i, j int) bool {
+		a, b := results[i].Addr, results[j].Addr
+		if a.Db != b.Db {
+			return a.Db < b.Db
+		}
+		if a.Byte != b.Byte {
+			return a.Byte < b.Byte
+		}
+		return a.Bit < b.Bit
+	})
+
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	w.Write([]string{"DB", "Byte", "Bit", "Value"})
+	for _, r := range results {
+		w.Write([]string{
+			strconv.Itoa(r.Addr.Db),
+			strconv.Itoa(r.Addr.Byte),
+			strconv.Itoa(r.Addr.Bit),
+			fmt.Sprintf("%v", r.Value),
+		})
+	}
+
+	return nil
 }
 
 func main() {
@@ -310,11 +367,16 @@ func main() {
 	}
 
 	lines := strings.Split(string(stdout), "\n")
-	values := processPackets(lines)
+	results := dedup(processPackets(lines))
 
-	for addr, val := range values {
-		if strings.HasPrefix(addr, "DB70.") {
-			fmt.Printf("%s = %v\n", addr, val)
+	if err := writeCSV("output.csv", results); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	for _, r := range results {
+		if r.Addr.Db == 70 {
+			fmt.Printf("%s = %v\n", r.Addr.String(), r.Value)
 		}
 	}
 }
