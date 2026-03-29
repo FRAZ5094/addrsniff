@@ -1,17 +1,20 @@
 package main
 
 import (
+	"addrsniff/s7comm"
 	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // tshark outputs single values as strings, multiple as arrays, so this is a wrapper to handle both cases
@@ -305,9 +308,16 @@ func processPackets(lines []string) []AddrValue {
 	return results
 }
 
-func runTshark(pcapFile string) ([]byte, error) {
+func runTshark(pcapFile string) (io.ReadCloser, error) {
 	cmd := exec.Command("tshark", "-r", pcapFile, "-T", "ek", "-Y", "s7comm")
-	return cmd.Output()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return stdout, nil
 }
 
 func dedup(results []AddrValue) []AddrValue {
@@ -360,23 +370,30 @@ func writeCSV(filename string, results []AddrValue) error {
 }
 
 func main() {
-	stdout, err := runTshark("pcap/Encoder_raw_value_242_27.3.26_morning.pcapng")
+	reader, err := runTshark("pcap/Encoder_raw_value_242_27.3.26_morning.pcapng")
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	lines := strings.Split(string(stdout), "\n")
-	results := dedup(processPackets(lines))
+	decoder := json.NewDecoder(reader)
 
-	if err := writeCSV("output.csv", results); err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	for _, r := range results {
-		if r.Addr.Db == 70 {
-			fmt.Printf("%s = %v\n", r.Addr.String(), r.Value)
+	for {
+		var packet Packet
+		if err := decoder.Decode(&packet); err != nil {
+			fmt.Println(err)
+			continue
 		}
+		data := packet.Layers.S7Comm
+
+		if data == nil {
+			fmt.Println("Skipping this packet")
+			continue
+		}
+
+		s7comm.Parse(data)
+
+		time.Sleep(time.Millisecond * 1000)
 	}
+
 }
