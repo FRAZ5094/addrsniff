@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -66,7 +67,8 @@ type Packet struct {
 }
 
 type S7CommHeader struct {
-	Rosctr string `json:"s7comm_s7comm_header_rosctr"`
+	Rosctr int `json:"s7comm_s7comm_header_rosctr,string"`
+	Func   int `json:"s7comm_s7comm_param_func,string"`
 }
 
 // When there is only one address it will output "123" instead of ["123"], so need to be able to handle both
@@ -90,13 +92,17 @@ func (f *FlexStrings) UnmarshalJSON(data []byte) error {
 
 type S7CommJob struct {
 	AddrBytes     FlexStrings `json:"s7comm_s7comm_param_item_address_byte"`
+	AddrBits      FlexStrings `json:"s7comm_s7comm_param_item_address_bit"`
 	DBs           FlexStrings `json:"s7comm_s7comm_param_item_db"`
 	TransportType FlexStrings `json:"s7comm_s7comm_param_item_transp_size"`
+	PDURef        int         `json:"s7comm_s7comm_header_pduref,string"`
 	ItemCount     int         `json:"s7comm_s7comm_param_itemcount,string"`
 }
 
 type JobData struct {
-	Addrs []DbAddress
+	PDURef    int
+	ItemCount int
+	Addrs     []DbAddress
 }
 
 func (a DbAddress) String() string {
@@ -104,7 +110,7 @@ func (a DbAddress) String() string {
 
 	switch a.Type {
 	case "BIT":
-		s += fmt.Sprintf("X%d.0", a.Byte)
+		s += fmt.Sprintf("X%d.%d", a.Byte, a.Bit)
 	case "BYTE":
 		s += fmt.Sprintf("B%d", a.Byte)
 	case "WORD", "INT":
@@ -121,6 +127,7 @@ func (a DbAddress) String() string {
 type DbAddress struct {
 	Db   int
 	Byte int
+	Bit  int
 	Type string
 }
 
@@ -145,9 +152,6 @@ func parseDbTagType(transportType string) (string, error) {
 	default:
 		return "Unknown", fmt.Errorf("invalid transport type: %s", transportType)
 	}
-}
-
-type AckData struct {
 }
 
 func parseJobRequest(data json.RawMessage) (*JobData, error) {
@@ -175,9 +179,15 @@ func parseJobRequest(data json.RawMessage) (*JobData, error) {
 			continue
 		}
 
+		bit, err := strconv.Atoi(job.AddrBits[i])
+		if err != nil {
+			continue
+		}
+
 		addr := DbAddress{
 			Db:   db,
 			Byte: byte,
+			Bit:  bit,
 			Type: tagType,
 		}
 
@@ -185,13 +195,45 @@ func parseJobRequest(data json.RawMessage) (*JobData, error) {
 	}
 
 	return &JobData{
-		Addrs: addrs,
+		Addrs:     addrs,
+		ItemCount: job.ItemCount,
+		PDURef:    job.PDURef,
 	}, nil
 }
 
-func parseAckDataResponse(data json.RawMessage) *AckData {
+type AckData struct {
+	PDURef    int
+	ItemCount int
+	Values    [][]byte
+}
 
-	return &AckData{}
+type S7CommAckData struct {
+	PDURef    int         `json:"s7comm_s7comm_header_pduref,string"`
+	ItemCount int         `json:"s7comm_s7comm_param_itemcount,string"`
+	Values    FlexStrings `json:"s7comm_s7comm_resp_data"`
+}
+
+func parseAckDataResponse(data json.RawMessage) (*AckData, error) {
+
+	var ackData S7CommAckData
+	if err := json.Unmarshal(data, &ackData); err != nil {
+		return nil, err
+	}
+
+	var values [][]byte
+	for i := range ackData.ItemCount {
+		value, err := hex.DecodeString(strings.ReplaceAll(ackData.Values[i], ":", ""))
+		if err != nil {
+			continue
+		}
+		values = append(values, value)
+	}
+
+	return &AckData{
+		PDURef:    ackData.PDURef,
+		ItemCount: ackData.ItemCount,
+		Values:    values,
+	}, nil
 }
 
 func main() {
@@ -214,6 +256,7 @@ func main() {
 	lines := strings.Split(string(stdout), "\n")
 
 	var jobPackets []JobData
+	var ackDataPackets []AckData
 
 	for i, line := range lines {
 
@@ -233,31 +276,29 @@ func main() {
 			fmt.Println("Failed to parse S7Comm Rosctr header:", err)
 		}
 
+		// We only care about read requests (4) not writes (5)
+		if header.Func != 4 {
+			continue
+		}
+
 		switch header.Rosctr {
-		case "1":
+		case 1:
 			if job, err := parseJobRequest(s7CommData); err != nil {
 				fmt.Println(err)
 			} else {
 				jobPackets = append(jobPackets, *job)
 			}
-		case "3":
-			parseAckDataResponse(s7CommData)
-		default:
-			// fmt.Println("Skipping rosctr of ", header.Rosctr)
+		case 3:
+			ackData, err := parseAckDataResponse(s7CommData)
+			if err != nil {
+				fmt.Println(err)
+			} else {
+				ackDataPackets = append(ackDataPackets, *ackData)
+			}
 		}
 
 	}
 
 	fmt.Println(jobPackets[0])
-
-	// var packets []Packet
-
-	// if err := json.Unmarshal(stdout, &packets); err != nil {
-	// 	fmt.Println("JSON parse error:", err)
-	// 	return
-	// }
-
-	// // fmt.Println("Packet count:", len(packets))
-	// fmt.Println(packets)
-
+	fmt.Println(ackDataPackets[0])
 }
