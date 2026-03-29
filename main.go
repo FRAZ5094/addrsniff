@@ -11,69 +11,21 @@ import (
 	"strings"
 )
 
-type Packet struct {
-	TimestampUnixMs string `json:"timestamp"`
-	Layers          struct {
-		S7Comm json.RawMessage `json:"s7comm"`
-	} `json:"layers"`
-}
-
-type S7CommHeader struct {
-	Rosctr int `json:"s7comm_s7comm_header_rosctr,string"`
-	Func   int `json:"s7comm_s7comm_param_func,string"`
-}
-
-// When there is only one address it will output "123" instead of ["123"], so need to be able to handle both
+// tshark outputs single values as strings, multiple as arrays, so this is a wrapper to handle both cases
 type FlexStrings []string
 
 func (f *FlexStrings) UnmarshalJSON(data []byte) error {
-	// Try array first
 	var arr []string
 	if err := json.Unmarshal(data, &arr); err == nil {
 		*f = arr
 		return nil
 	}
-	// Fall back to single string
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
 	*f = []string{s}
 	return nil
-}
-
-type S7CommJob struct {
-	AddrBytes     FlexStrings `json:"s7comm_s7comm_param_item_address_byte"`
-	AddrBits      FlexStrings `json:"s7comm_s7comm_param_item_address_bit"`
-	DBs           FlexStrings `json:"s7comm_s7comm_param_item_db"`
-	TransportType FlexStrings `json:"s7comm_s7comm_param_item_transp_size"`
-	PDURef        int         `json:"s7comm_s7comm_header_pduref,string"`
-	ItemCount     int         `json:"s7comm_s7comm_param_itemcount,string"`
-}
-
-type JobData struct {
-	PDURef    int
-	ItemCount int
-	Addrs     []DbAddress
-}
-
-func (a DbAddress) String() string {
-	s := fmt.Sprintf("DB%d.DB", a.Db)
-
-	switch a.Type {
-	case BIT:
-		s += fmt.Sprintf("X%d.%d", a.Byte, a.Bit)
-	case BYTE:
-		s += fmt.Sprintf("B%d", a.Byte)
-	case WORD, INT:
-		s += fmt.Sprintf("W%d", a.Byte)
-	case DWORD, DINT, REAL:
-		s += fmt.Sprintf("D%d", a.Byte)
-	default:
-		return ""
-	}
-
-	return s
 }
 
 type DbDataType int
@@ -112,17 +64,10 @@ func (d DbDataType) String() string {
 	}
 }
 
-type DbAddress struct {
-	Db   int
-	Byte int
-	Bit  int
-	Type DbDataType
-}
-
-func parseDbTagType(transportType string) (DbDataType, error) {
-	v, err := strconv.Atoi(transportType)
+func parseDbDataType(s string) (DbDataType, error) {
+	v, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, fmt.Errorf("invalid transport type: %s", transportType)
+		return 0, fmt.Errorf("invalid transport type: %s", s)
 	}
 	dt := DbDataType(v)
 	if dt < BIT || dt > REAL {
@@ -131,7 +76,36 @@ func parseDbTagType(transportType string) (DbDataType, error) {
 	return dt, nil
 }
 
-func convertValue(data []byte, dataType DbDataType) (any, error) {
+type DbAddress struct {
+	Db   int
+	Byte int
+	Bit  int
+	Type DbDataType
+}
+
+func (a DbAddress) String() string {
+	s := fmt.Sprintf("DB%d.DB", a.Db)
+	switch a.Type {
+	case BIT:
+		s += fmt.Sprintf("X%d.%d", a.Byte, a.Bit)
+	case BYTE:
+		s += fmt.Sprintf("B%d", a.Byte)
+	case WORD, INT:
+		s += fmt.Sprintf("W%d", a.Byte)
+	case DWORD, DINT, REAL:
+		s += fmt.Sprintf("D%d", a.Byte)
+	default:
+		return ""
+	}
+	return s
+}
+
+func convertValue(hexStr string, dataType DbDataType) (any, error) {
+	data, err := hex.DecodeString(strings.ReplaceAll(hexStr, ":", ""))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode hex: %w", err)
+	}
+
 	switch dataType {
 	case BIT:
 		if len(data) < 1 {
@@ -173,112 +147,97 @@ func convertValue(data []byte, dataType DbDataType) (any, error) {
 	}
 }
 
-func parseJobRequest(data json.RawMessage) (*JobData, error) {
-
-	var job S7CommJob
-	if err := json.Unmarshal(data, &job); err != nil {
-		return nil, err
-	}
-
-	var addrs []DbAddress
-
-	for i := range job.ItemCount {
-		db, err := strconv.Atoi(job.DBs[i])
-		if err != nil {
-			continue
-		}
-
-		byte, err := strconv.Atoi(job.AddrBytes[i])
-		if err != nil {
-			continue
-		}
-
-		tagType, err := parseDbTagType(job.TransportType[i])
-		if err != nil {
-			continue
-		}
-
-		bit, err := strconv.Atoi(job.AddrBits[i])
-		if err != nil {
-			continue
-		}
-
-		addr := DbAddress{
-			Db:   db,
-			Byte: byte,
-			Bit:  bit,
-			Type: tagType,
-		}
-
-		addrs = append(addrs, addr)
-	}
-
-	return &JobData{
-		Addrs:     addrs,
-		ItemCount: job.ItemCount,
-		PDURef:    job.PDURef,
-	}, nil
+type Packet struct {
+	TimestampUnixMs string `json:"timestamp"`
+	Layers          struct {
+		S7Comm json.RawMessage `json:"s7comm"`
+	} `json:"layers"`
 }
 
-type AckData struct {
-	PDURef    int
-	ItemCount int
-	Values    [][]byte
+type S7CommHeader struct {
+	Rosctr int `json:"s7comm_s7comm_header_rosctr,string"`
+	Func   int `json:"s7comm_s7comm_param_func,string"`
 }
 
-type S7CommAckData struct {
+type S7CommJobRaw struct {
+	AddrBytes     FlexStrings `json:"s7comm_s7comm_param_item_address_byte"`
+	AddrBits      FlexStrings `json:"s7comm_s7comm_param_item_address_bit"`
+	DBs           FlexStrings `json:"s7comm_s7comm_param_item_db"`
+	TransportType FlexStrings `json:"s7comm_s7comm_param_item_transp_size"`
+	PDURef        int         `json:"s7comm_s7comm_header_pduref,string"`
+	ItemCount     int         `json:"s7comm_s7comm_param_itemcount,string"`
+}
+
+type S7CommAckDataRaw struct {
 	PDURef    int         `json:"s7comm_s7comm_header_pduref,string"`
 	ItemCount int         `json:"s7comm_s7comm_param_itemcount,string"`
 	Values    FlexStrings `json:"s7comm_s7comm_resp_data"`
 }
 
-func parseAckDataResponse(data json.RawMessage) (*AckData, error) {
+type JobData struct {
+	PDURef int
+	Addrs  []DbAddress
+}
 
-	var ackData S7CommAckData
-	if err := json.Unmarshal(data, &ackData); err != nil {
+type AckData struct {
+	PDURef int
+	Values []string
+}
+
+func parseJobRequest(data json.RawMessage) (*JobData, error) {
+	var raw S7CommJobRaw
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	var values [][]byte
-	for i := range ackData.ItemCount {
-		value, err := hex.DecodeString(strings.ReplaceAll(ackData.Values[i], ":", ""))
+	addrs := make([]DbAddress, 0, raw.ItemCount)
+	for i := range raw.ItemCount {
+		db, err := strconv.Atoi(raw.DBs[i])
 		if err != nil {
 			continue
 		}
-		values = append(values, value)
+		byteAddr, err := strconv.Atoi(raw.AddrBytes[i])
+		if err != nil {
+			continue
+		}
+		tagType, err := parseDbDataType(raw.TransportType[i])
+		if err != nil {
+			continue
+		}
+		bit, err := strconv.Atoi(raw.AddrBits[i])
+		if err != nil {
+			continue
+		}
+		addrs = append(addrs, DbAddress{
+			Db:   db,
+			Byte: byteAddr,
+			Bit:  bit,
+			Type: tagType,
+		})
 	}
 
-	return &AckData{
-		PDURef:    ackData.PDURef,
-		ItemCount: ackData.ItemCount,
-		Values:    values,
-	}, nil
+	return &JobData{PDURef: raw.PDURef, Addrs: addrs}, nil
 }
 
-func main() {
-	app := "tshark"
-
-	arg0 := "-r"
-	arg1 := `pcap/Encoder_raw_value_242_27.3.26_morning.pcapng`
-	arg2 := "-T"
-	arg3 := "ek"
-	arg4 := "-Y"
-	arg5 := "s7comm"
-
-	cmd := exec.Command(app, arg0, arg1, arg2, arg3, arg4, arg5)
-	stdout, err := cmd.Output()
-	if err != nil {
-		fmt.Println(err.Error())
-		return
+func parseAckDataResponse(data json.RawMessage) (*AckData, error) {
+	var raw S7CommAckDataRaw
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
 	}
+	return &AckData{PDURef: raw.PDURef, Values: []string(raw.Values)}, nil
+}
 
-	lines := strings.Split(string(stdout), "\n")
+func parseS7CommHeader(data json.RawMessage) (S7CommHeader, error) {
+	var header S7CommHeader
+	err := json.Unmarshal(data, &header)
+	return header, err
+}
 
-	pendingJobs := make(map[int]*JobData) // keyed by PDURef
-	values := make(map[string]any)        // keyed by Siemens address string
+func processPackets(lines []string) map[string]any {
+	pendingJobs := make(map[int][]*JobData)
+	values := make(map[string]any)
 
 	for i, line := range lines {
-
 		if i%2 == 0 || len(line) == 0 {
 			continue
 		}
@@ -289,38 +248,38 @@ func main() {
 			continue
 		}
 
-		s7CommData := packet.Layers.S7Comm
-
-		var header S7CommHeader
-		if err := json.Unmarshal(s7CommData, &header); err != nil {
-			fmt.Println("Failed to parse S7Comm Rosctr header:", err)
+		header, err := parseS7CommHeader(packet.Layers.S7Comm)
+		if err != nil {
+			fmt.Println("Failed to parse S7Comm header:", err)
 			continue
 		}
 
-		// We only care about read requests (4) not writes (5)
 		if header.Func != 4 {
 			continue
 		}
 
 		switch header.Rosctr {
 		case 1:
-			job, err := parseJobRequest(s7CommData)
+			job, err := parseJobRequest(packet.Layers.S7Comm)
 			if err != nil {
 				fmt.Println(err)
 				continue
 			}
-			pendingJobs[job.PDURef] = job
+			pendingJobs[job.PDURef] = append(pendingJobs[job.PDURef], job)
 		case 3:
-			ackData, err := parseAckDataResponse(s7CommData)
+			ackData, err := parseAckDataResponse(packet.Layers.S7Comm)
 			if err != nil {
 				fmt.Println(err)
 				continue
 			}
-			job, ok := pendingJobs[ackData.PDURef]
-			if !ok {
+			queue, ok := pendingJobs[ackData.PDURef]
+			if !ok || len(queue) == 0 {
 				fmt.Printf("No matching job for PDURef %d\n", ackData.PDURef)
 				continue
 			}
+			job := queue[0]
+			pendingJobs[ackData.PDURef] = queue[1:]
+
 			for j, addr := range job.Addrs {
 				if j >= len(ackData.Values) {
 					break
@@ -332,13 +291,29 @@ func main() {
 				}
 				values[addr.String()] = val
 			}
-			delete(pendingJobs, ackData.PDURef)
 		}
-
 	}
 
+	return values
+}
+
+func runTshark(pcapFile string) ([]byte, error) {
+	cmd := exec.Command("tshark", "-r", pcapFile, "-T", "ek", "-Y", "s7comm")
+	return cmd.Output()
+}
+
+func main() {
+	stdout, err := runTshark("pcap/Encoder_raw_value_242_27.3.26_morning.pcapng")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	lines := strings.Split(string(stdout), "\n")
+	values := processPackets(lines)
+
 	for addr, val := range values {
-		if addr == "DB190.DBD360" {
+		if strings.HasPrefix(addr, "DB70.") {
 			fmt.Printf("%s = %v\n", addr, val)
 		}
 	}
