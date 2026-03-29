@@ -1,63 +1,15 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
 )
-
-// tshark -r pcap/Encoder_raw_value_242_27.3.26_morning.pcapng -T ek -Y "s7comm" -c 3 | tail -n 1 | jq 'select(.layers) | .layers.s7comm' >> s7ackdata.json
-
-// const (
-// 	Job      Rosctr = 1
-// 	Ack      Rosctr = 2
-// 	AckData  Rosctr = 3
-// 	UserData Rosctr = 7
-// )
-
-// func (r *Rosctr) UnmarshalJSON(data []byte) error {
-// 	var str string
-// 	if err := json.Unmarshal(data, &str); err != nil {
-// 		return fmt.Errorf("failed to unmarshal rosctr to string: %w", err)
-// 	}
-
-// 	var rosctr Rosctr
-
-// 	switch str {
-// 	case "1":
-// 		rosctr = Job
-// 	case "2":
-// 		rosctr = Ack
-// 	case "3":
-// 		rosctr = AckData
-// 	case "7":
-// 		rosctr = UserData
-// 	default:
-// 		return fmt.Errorf("invalid value for rosctr in s7comms header:%s", str)
-// 	}
-
-// 	*r = rosctr
-
-// 	return nil
-// }
-
-// func (r Rosctr) String() string {
-// 	switch r {
-// 	case Job:
-// 		return "Job"
-// 	case Ack:
-// 		return "Ack"
-// 	case AckData:
-// 		return "AckData"
-// 	case UserData:
-// 		return "UserData"
-// 	default:
-// 		return fmt.Sprintf("Unknown Rosctr: %d", r)
-// 	}
-// }
 
 type Packet struct {
 	TimestampUnixMs string `json:"timestamp"`
@@ -109,13 +61,13 @@ func (a DbAddress) String() string {
 	s := fmt.Sprintf("DB%d.DB", a.Db)
 
 	switch a.Type {
-	case "BIT":
+	case BIT:
 		s += fmt.Sprintf("X%d.%d", a.Byte, a.Bit)
-	case "BYTE":
+	case BYTE:
 		s += fmt.Sprintf("B%d", a.Byte)
-	case "WORD", "INT":
+	case WORD, INT:
 		s += fmt.Sprintf("W%d", a.Byte)
-	case "DWORD", "DINT", "REAL":
+	case DWORD, DINT, REAL:
 		s += fmt.Sprintf("D%d", a.Byte)
 	default:
 		return ""
@@ -124,33 +76,100 @@ func (a DbAddress) String() string {
 	return s
 }
 
+type DbDataType int
+
+const (
+	BIT   DbDataType = 1
+	BYTE  DbDataType = 2
+	CHAR  DbDataType = 3
+	WORD  DbDataType = 4
+	INT   DbDataType = 5
+	DWORD DbDataType = 6
+	DINT  DbDataType = 7
+	REAL  DbDataType = 8
+)
+
+func (d DbDataType) String() string {
+	switch d {
+	case BIT:
+		return "BIT"
+	case BYTE:
+		return "BYTE"
+	case CHAR:
+		return "CHAR"
+	case WORD:
+		return "WORD"
+	case INT:
+		return "INT"
+	case DWORD:
+		return "DWORD"
+	case DINT:
+		return "DINT"
+	case REAL:
+		return "REAL"
+	default:
+		return fmt.Sprintf("Unknown(%d)", d)
+	}
+}
+
 type DbAddress struct {
 	Db   int
 	Byte int
 	Bit  int
-	Type string
+	Type DbDataType
 }
 
-func parseDbTagType(transportType string) (string, error) {
-	switch transportType {
-	case "1":
-		return "BIT", nil
-	case "2":
-		return "BYTE", nil
-	case "3":
-		return "CHAR", nil
-	case "4":
-		return "WORD", nil
-	case "5":
-		return "INT", nil
-	case "6":
-		return "DWORD", nil
-	case "7":
-		return "DINT", nil
-	case "8":
-		return "REAL", nil
+func parseDbTagType(transportType string) (DbDataType, error) {
+	v, err := strconv.Atoi(transportType)
+	if err != nil {
+		return 0, fmt.Errorf("invalid transport type: %s", transportType)
+	}
+	dt := DbDataType(v)
+	if dt < BIT || dt > REAL {
+		return 0, fmt.Errorf("unknown transport type: %d", v)
+	}
+	return dt, nil
+}
+
+func convertValue(data []byte, dataType DbDataType) (any, error) {
+	switch dataType {
+	case BIT:
+		if len(data) < 1 {
+			return nil, fmt.Errorf("not enough bytes for BIT")
+		}
+		return data[0] != 0, nil
+	case BYTE, CHAR:
+		if len(data) < 1 {
+			return nil, fmt.Errorf("not enough bytes for BYTE")
+		}
+		return data[0], nil
+	case WORD:
+		if len(data) < 2 {
+			return nil, fmt.Errorf("not enough bytes for WORD")
+		}
+		return binary.BigEndian.Uint16(data), nil
+	case INT:
+		if len(data) < 2 {
+			return nil, fmt.Errorf("not enough bytes for INT")
+		}
+		return int16(binary.BigEndian.Uint16(data)), nil
+	case DWORD:
+		if len(data) < 4 {
+			return nil, fmt.Errorf("not enough bytes for DWORD")
+		}
+		return binary.BigEndian.Uint32(data), nil
+	case DINT:
+		if len(data) < 4 {
+			return nil, fmt.Errorf("not enough bytes for DINT")
+		}
+		return int32(binary.BigEndian.Uint32(data)), nil
+	case REAL:
+		if len(data) < 4 {
+			return nil, fmt.Errorf("not enough bytes for REAL")
+		}
+		return math.Float32frombits(binary.BigEndian.Uint32(data)), nil
 	default:
-		return "Unknown", fmt.Errorf("invalid transport type: %s", transportType)
+		return nil, fmt.Errorf("unsupported data type: %s", dataType)
 	}
 }
 
