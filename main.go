@@ -274,8 +274,8 @@ func main() {
 
 	lines := strings.Split(string(stdout), "\n")
 
-	var jobPackets []JobData
-	var ackDataPackets []AckData
+	pendingJobs := make(map[int]*JobData) // keyed by PDURef
+	values := make(map[string]any)        // keyed by Siemens address string
 
 	for i, line := range lines {
 
@@ -286,6 +286,7 @@ func main() {
 		var packet Packet
 		if err := json.Unmarshal([]byte(line), &packet); err != nil {
 			fmt.Println("JSON parse error:", err)
+			continue
 		}
 
 		s7CommData := packet.Layers.S7Comm
@@ -293,6 +294,7 @@ func main() {
 		var header S7CommHeader
 		if err := json.Unmarshal(s7CommData, &header); err != nil {
 			fmt.Println("Failed to parse S7Comm Rosctr header:", err)
+			continue
 		}
 
 		// We only care about read requests (4) not writes (5)
@@ -302,22 +304,42 @@ func main() {
 
 		switch header.Rosctr {
 		case 1:
-			if job, err := parseJobRequest(s7CommData); err != nil {
+			job, err := parseJobRequest(s7CommData)
+			if err != nil {
 				fmt.Println(err)
-			} else {
-				jobPackets = append(jobPackets, *job)
+				continue
 			}
+			pendingJobs[job.PDURef] = job
 		case 3:
 			ackData, err := parseAckDataResponse(s7CommData)
 			if err != nil {
 				fmt.Println(err)
-			} else {
-				ackDataPackets = append(ackDataPackets, *ackData)
+				continue
 			}
+			job, ok := pendingJobs[ackData.PDURef]
+			if !ok {
+				fmt.Printf("No matching job for PDURef %d\n", ackData.PDURef)
+				continue
+			}
+			for j, addr := range job.Addrs {
+				if j >= len(ackData.Values) {
+					break
+				}
+				val, err := convertValue(ackData.Values[j], addr.Type)
+				if err != nil {
+					fmt.Println(err)
+					continue
+				}
+				values[addr.String()] = val
+			}
+			delete(pendingJobs, ackData.PDURef)
 		}
 
 	}
 
-	fmt.Println(jobPackets[0])
-	fmt.Println(ackDataPackets[0])
+	for addr, val := range values {
+		if addr == "DB190.DBD360" {
+			fmt.Printf("%s = %v\n", addr, val)
+		}
+	}
 }
